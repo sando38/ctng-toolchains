@@ -1,0 +1,309 @@
+name: 'Docker: build and publish container images'
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+#  DOCKERHUB_REPO: docker.io/eturnal/eturnal
+  UBUNTU_VSN: 22.04
+  SVC_REGISTRY: 'localhost:5000'
+  APP: 'eturnal'
+
+jobs:
+  build-ctng-toolchains-gnu:
+    name: Ubuntu ${{ matrix.arch }}-${{ matrix.libc }} - build toolchains & deps
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+        libc: [gnu, musl]
+      fail-fast: false
+    #needs: [detect-change]
+    steps:
+      -
+        name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      -
+        name: Install prerequisites
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install makeself build-essential
+          # https://github.com/crosstool-ng/crosstool-ng/blob/master/testing/docker/ubuntu22.04/Dockerfile
+          sudo apt-get -qq install gcc g++ gperf bison flex texinfo help2man make libncurses5-dev
+          sudo apt-get -qq install python3-dev autoconf automake libtool libtool-bin gawk wget bzip2 xz-utils unzip
+          sudo apt-get -qq install patch libstdc++6 rsync git meson ninja-build
+      -
+        name: Extract environment variables ...
+        run: echo "TAG=$(cat tag-${{ ENV.APP }})" >> $GITHUB_ENV
+      -
+        name: Cache toolchain directory
+        uses: actions/cache@v3
+        with:
+          path: ~/ubuntu-ctng-${{ matrix.arch }}-${{ matrix.libc }}/
+          key: ubuntu-${{ matrix.arch }}-${{ matrix.libc }}-${{ ENV.TAG }}
+      -
+        name: Build toolchains ...
+        run: |
+          sed -e '/build_rel "$mode"/ s/^#*/#/' -i scripts/ctng-${{ ENV.APP }}
+          sed -i "s|targets='.*'|targets='${{ matrix.arch }}-linux-${{ matrix.libc }}'|" scripts/ctng-${{ ENV.APP }}
+          chmod +x scripts/ctng-${{ ENV.APP }}
+          BUILD_DIR=$HOME/ubuntu-ctng-${{ matrix.arch }}-${{ matrix.libc }} \
+            CTNG_VSN=crosstool-ng-1.25.0 scripts/ctng-${{ ENV.APP }}
+ 
+  ## build musl-libc based binary tarballs for x64/arm64
+  build-ctng-gnu-ctr:
+    name: Ubuntu - build ctr with glibc based toolchains
+    runs-on: ubuntu-22.04
+    needs: [build-ctng-toolchains-gnu]
+    permissions:
+      packages: write
+    steps:
+      -
+        name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      -
+        name: Extract environment variables ...
+        run: echo "TAG=$(cat tag-${{ ENV.APP }})" >> $GITHUB_ENV
+      -
+        name: x86_64-gnu - Cache toolchain directory
+        uses: actions/cache@v3
+        with:
+          path: ~/ubuntu-ctng-x86_64-gnu/
+          key: ubuntu-x86_64-gnu-${{ ENV.TAG }}
+      -
+        name: x86_64-musl - Cache toolchain directory
+        uses: actions/cache@v3
+        with:
+          path: ~/ubuntu-ctng-x86_64-musl/
+          key: ubuntu-x86_64-musl-${{ ENV.TAG }}
+      -
+        name: aarch64-gnu - Cache toolchain directory
+        uses: actions/cache@v3
+        with:
+          path: ~/ubuntu-ctng-aarch64-gnu/
+          key: ubuntu-aarch64-gnu-${{ ENV.TAG }}
+      -
+        name: aarch64-musl - Cache toolchain directory
+        uses: actions/cache@v3
+        with:
+          path: ~/ubuntu-ctng-aarch64-musl/
+          key: ubuntu-aarch64-musl-${{ ENV.TAG }}
+      -
+        name: Prepare docker build context ...
+        run: |
+          mkdir -p ctng/x-tools
+          cp -r $HOME/ubuntu-ctng-x86_64-gnu/x-tools/* ctng/x-tools
+          cp -r $HOME/ubuntu-ctng-x86_64-musl/x-tools/* ctng/x-tools
+          cp -r $HOME/ubuntu-ctng-aarch64-gnu/x-tools/* ctng/x-tools
+          cp -r $HOME/ubuntu-ctng-aarch64-musl/x-tools/* ctng/x-tools
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - 
+        name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            ${{ ENV.TAG }}-ubuntu
+      -
+        name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      -
+        name: Build container image
+        uses: docker/build-push-action@v4
+        with:
+          build-args: |
+            UBUNTU_VSN=${{ ENV.UBUNTU_VSN }}
+            LIBC=gnu
+            APP=${{ ENV.APP }}
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          ulimit: nofile=2048:4096
+          load: true
+          target: ctng
+          tags: ${{ steps.meta.outputs.tags }} 
+          labels: ${{ steps.meta.outputs.labels }}
+
+  ## build musl-libc based binary tarballs for x64/arm64
+  build-ctng-toolchains-musl:
+    name: Alpine ${{ matrix.arch }}-${{ matrix.libc }} - build toolchains & deps
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+        libc: [musl]
+      fail-fast: false
+    steps:
+      -
+        name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      -
+        name: Extract environment variables ...
+        run: |
+          echo "TAG=$(cat tag-${{ ENV.APP }})" >> $GITHUB_ENV
+          echo "UID=$(id -u $(whoami))" >> $GITHUB_ENV
+      -
+        name: Cache toolchain directory
+        uses: actions/cache@v3
+        with:
+          path: ~/alpine-ctng-${{ matrix.arch }}-${{ matrix.libc }}/
+          key: alpine-${{ matrix.arch }}-${{ matrix.libc }}-${{ ENV.TAG }}
+      -
+        name: Copy tool chain from cache, otherwise build toolchain ...
+        run: |
+          if [ -d "$HOME/alpine-ctng-${{ matrix.arch }}-${{ matrix.libc }}/x-tools/${{ matrix.arch }}-linux-${{ matrix.libc }}" ]
+          then
+            mkdir -p ctng/x-tools
+            cp -r $HOME/alpine-ctng-${{ matrix.arch }}-${{ matrix.libc }}/x-tools/* ctng/x-tools
+            echo "CTNG=local" >> $GITHUB_ENV
+          else
+            echo "CTNG=build" >> $GITHUB_ENV
+          fi
+      -
+        name: Set up QEMU
+        if: env.CTNG == 'build'
+        uses: docker/setup-qemu-action@v2
+      -
+        name: Set up Docker Buildx
+        if: env.CTNG == 'build'
+        uses: docker/setup-buildx-action@v2
+      -
+        name: Extract metadata (tags, labels) for Docker
+        if: env.CTNG == 'build'
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            ${{ ENV.TAG }}-alpine
+      -
+        name: Log in to GHCR
+        if: env.CTNG == 'build'
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      -
+        name: Build container image
+        uses: docker/build-push-action@v4
+        if: env.CTNG == 'build'
+        with:
+          build-args: |
+            CTNG=${{ ENV.CTNG }}
+            UID=${{ ENV.UID }}
+            CTNG_VSN=ee5a4026c3560c6b313313cf78236a60e300ee93
+            LIBC=${{ matrix.libc }}
+            APP=${{ ENV.APP }}
+            TARGETS=${{ matrix.arch }}-linux-${{ matrix.libc }}
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          ulimit: nofile=2048:4096
+          load: true
+          target: ctng
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      -
+        name: Copy toolchain from container to cache ...
+        if: env.CTNG == 'build'
+        run: |
+          mkdir -p $HOME/alpine-ctng-${{ matrix.arch }}-${{ matrix.libc }}/x-tools
+          docker run --rm --name ctng-${{ ENV.APP }} \
+            -v $HOME/alpine-ctng-${{ matrix.arch }}-${{ matrix.libc }}:/tmp \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ ENV.TAG }}-alpine \
+            cp -r /ctng/x-tools /tmp
+
+  ## build musl-libc based binary tarballs for x64/arm64
+  build-ctng-musl-ctr:
+    name: Alpine - build ctr with musl-libc based toolchains
+    runs-on: ubuntu-22.04
+    needs: [build-ctng-toolchains-musl]
+    permissions:
+      packages: write
+    steps:
+      -
+        name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      -
+        name: Extract environment variables ...
+        run: echo "TAG=$(cat tag-${{ ENV.APP }})" >> $GITHUB_ENV
+      -
+        name: x86_64-musl - Cache toolchain directory
+        uses: actions/cache@v3
+        with:
+          path: ~/alpine-ctng-x86_64-musl/
+          key: alpine-x86_64-musl-${{ ENV.TAG }}
+      -
+        name: aarch64-musl - Cache toolchain directory
+        uses: actions/cache@v3
+        with:
+          path: ~/alpine-ctng-aarch64-musl/
+          key: alpine-aarch64-musl-${{ ENV.TAG }}
+      -
+        name: Prepare docker build context ...
+        run: |
+          mkdir -p ctng/x-tools
+          cp -r $HOME/alpine-ctng-x86_64-musl/x-tools/* ctng/x-tools
+          cp -r $HOME/alpine-ctng-aarch64-musl/x-tools/* ctng/x-tools
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      -
+        name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            ${{ ENV.TAG }}-alpine
+      -
+        name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      -
+        name: Build container image
+        uses: docker/build-push-action@v4
+        with:
+          build-args: |
+            LIBC=musl
+            APP=${{ ENV.APP }}
+            TARGETS=x86_64-linux-musl aarch64-linux-musl
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          ulimit: nofile=2048:4096
+          push: true
+          target: ctng
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
